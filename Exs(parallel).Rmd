@@ -1,0 +1,308 @@
+---
+title: "Exercício  - Modelagem Preditiva Avançada - INSPER"
+author: "Leonardo Giovanelli"
+date: "28/05/2020"
+output:
+  html_document:
+    number_sections: yes
+---
+
+
+
+``` {r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning=FALSE,plot_ly=TRUE)
+```
+
+
+# Bibliotecas
+
+``` {r,message=FALSE,cache=TRUE}
+library(rmarkdown)
+library(tidyverse) 
+library(tidymodels)
+library(ggplot2)
+library(GGally)
+library(plotly)
+library(ggcorrplot)
+library(ggfortify)
+library(skimr)
+library(caret)
+library(factoextra)
+library(reactable)
+library(glmnet)
+library(kknn)
+library(ranger)
+library(vip)
+library(ROCR)
+library(pROC)
+
+```
+
+``` {r , echo=FALSE,include=FALSE}
+diretorio <- 'C:/Users/leona/OneDrive/Insper/Materias/MODELAGEM PREDITIVA AVANCADA/Exs/Base'
+setwd(diretorio)
+```
+
+# Base de dados
+
+
+```{r , layout="l-body-outset", echo=TRUE,cache=TRUE}
+data <- read.csv(file = 'audit_risk.csv')
+skim(data)
+
+df <- na.omit(data)
+df <-  sapply(df, as.numeric)
+df <- na.omit(df)
+
+#Excluir variáveis cuja variância vale 0 e normalizar df
+
+df <- as.data.frame(scale
+      (as.data.frame(df[, apply(df,2,var) != 0]))) 
+```
+
+
+# Análise Descritiva
+
+## Media e desvio padrão por grupo de Risco (0 e 1)
+```{r,echo=TRUE,cache=TRUE,warning=FALSE}
+
+c <- df %>% 
+  group_by(Risk) %>% 
+  summarise_all(.funs = list(M=mean,ST=sd))
+c <- round(c,2)
+c <- as.data.frame(t(c))
+colnames(c) <- c("Risk0","Risk1")
+c <- na.omit(c)
+
+names <- colnames(df[1:25])
+cc<- tibble(Variavel=names[1:25],MEDIA0=c$Risk0[2:26],
+            SD0=c$Risk0[27:51],
+            MEDIA1=c$Risk1[2:26],SD1=c$Risk1[27:51])
+
+fig <- plot_ly(data=cc, x = ~Variavel, 
+               y = ~MEDIA0, type = 'bar',name="MEDIA0")
+fig <- fig %>% add_trace(y = ~cc$SD0, name = 'SD0')
+fig <- fig %>% add_trace(y = ~cc$MEDIA1, name = 'MEDIA1')
+fig <- fig %>% add_trace(y = ~cc$SD1, name = 'SD1')
+fig <- fig %>% layout(barmode = 'group')
+fig <- fig %>% layout(title = "Media e desvio padraão por grupo de Risk (0 ou 1)"
+                      ,yaxis = list(title=""))
+fig
+
+
+```
+
+```{r,warning=FALSE,include=FALSE}
+remove(fig,f,y,cc,l,c,names)
+```
+
+## PCA
+
+Analisando o PCA é possível determinar o melhor número de variáveis ou corte para ser utilizado.
+```{r,echo=TRUE,cache=TRUE,warning=FALSE,message=FALSE}
+df_pca <- df %>% select(-'Risk')
+res_pca <- prcomp(df_pca)
+fviz_eig(res_pca)
+s <- summary(res_pca)
+s <- as.data.frame(round(s$importance,3))
+
+reactable(s,highlight = TRUE,resizable = TRUE,compact = TRUE)
+
+```
+
+```{r,warning=FALSE,include=FALSE}
+remove(s,res_pca,df_pca)
+```
+##  Correlação entre variáveis
+
+```{r,cache=TRUE,include=TRUE}
+c <- df %>% 
+  cor() %>% 
+  ggcorrplot(lab = TRUE, lab_size = 2, tl.cex = 10, type = "upper",colors = c("red", "white", "blue"),show.diag = TRUE,digits = 1)
+ggplotly(c)
+
+
+corr <- function(x){cor(x,df$Risk)}
+corre <- map_dbl(df %>% select(-'Risk'),corr)
+corre <- as.data.frame(corre)
+
+fig <- plot_ly(
+  x = row.names(corre),
+  y = corre$corre,
+  text = row.names(corre),
+  name = "Correlacao com Risco",
+  type = 'bar', orientation = 'v',
+  color = ~corre$corre,colors = c("red","white","blue"))
+
+fig <- fig %>% layout(title = "Correlação com Risk",yaxis = list(title="Corrleção"))
+fig
+
+```
+
+```{r,warning=FALSE,include=FALSE}
+remove(fig,corr,corre,c)
+```
+
+
+# Tidymodels
+
+## Processamento em paralelo
+```{r,message=FALSE}
+library(doParallel)
+all_cores <- parallel::detectCores(logical = TRUE)-2
+cl <- makeCluster(all_cores)
+registerDoParallel(cl)
+```
+
+
+## Treinamento e Teste
+```{r,echo=TRUE,cache=TRUE,warning=FALSE,message=FALSE}
+
+df <-  as.data.frame(sapply(data, as.numeric)) %>% 
+  mutate(Risk=factor(Risk))
+
+
+split <- initial_split(df, prop = 0.7, strata = "Risk")
+
+treinamento <- training(split)
+teste <- testing(split)
+
+cv_split <- vfold_cv(treinamento, v = 10, strata = "Risk")
+
+```
+## Receita
+```{r,echo=TRUE,cache=TRUE,warning=FALSE,message=FALSE}
+
+
+receita <- recipe(Risk ~ ., treinamento) %>%
+    step_naomit(all_numeric()) %>% 
+    step_pca(all_numeric(), -all_outcomes() , num_comp = 15) %>% 
+    step_center(all_numeric()) %>%
+    step_scale(all_numeric()) 
+
+   
+receita_prep <- prep(receita)
+
+treinamento_proc <- juice(receita_prep)
+
+teste_proc <- bake(receita_prep, new_data = teste)
+
+
+cv_split <- vfold_cv(treinamento, v = 10, strata = "Risk")
+
+```
+
+## Lasso
+```{r,echo=TRUE,cache=TRUE,warning=TRUE,message=FALSE}
+
+lasso <- logistic_reg(penalty = tune()) %>% 
+           set_engine("glmnet") %>% 
+          set_mode("classification")
+
+lambda_tune <- tune_grid(lasso,
+                         receita,
+                        resamples = cv_split,
+                       metrics = metric_set(roc_auc, accuracy),
+                      grid = 50)
+
+autoplot(lambda_tune)
+
+
+ best <- select_best(lambda_tune, "accuracy")
+ lasso <- finalize_model(lasso, parameters = best)
+ fit_lasso <- fit(lasso, Risk ~ ., data = treinamento_proc)
+ 
+ pred_lasso <- predict(fit_lasso,teste_proc)
+
+```
+
+
+## Random Forest
+```{r,echo=TRUE,cache=TRUE,warning=TRUE,message=FALSE}
+
+rf <- rand_forest(mtry=tune(),trees=tune()) %>% 
+           set_engine("ranger",importance = "permutation") %>% 
+          set_mode("classification") %>% 
+          translate()
+
+
+rf_tune <- tune_grid(rf,
+                   receita,
+                   resamples = cv_split,
+                   metrics = metric_set(roc_auc, accuracy),
+                   grid = 10)
+
+autoplot(rf_tune)
+
+best <- select_best(rf_tune, "roc_auc")
+rf <- finalize_model(rf, parameters = best)
+fit_rf <- fit(rf, Risk ~ ., data = treinamento_proc)
+
+pred_rf<- predict(fit_rf,teste_proc)
+ 
+```
+
+## KNN
+
+```{r,echo=TRUE,cache=TRUE,warning=TRUE,message=FALSE}
+
+knn <- nearest_neighbor(neighbors = tune()) %>% 
+           set_engine("kknn") %>% 
+          set_mode("classification")
+
+
+knn_tune <- tune_grid(knn,
+                         receita,
+                        resamples = cv_split,
+                       metrics = metric_set(roc_auc, accuracy),
+                      grid = 50)
+
+
+autoplot(knn_tune)
+
+ best <- select_best(knn_tune, "roc_auc")
+ knn <- finalize_model(knn, parameters = best)
+ fit_knn <- fit(knn, Risk ~ ., data = treinamento_proc)
+ 
+ pred_knn <- predict(fit_knn,teste_proc)
+```
+
+
+
+
+# Compração entre modelos
+
+```{r,echo=TRUE,cache=TRUE,warning=TRUE,message=FALSE}
+stopCluster(cl)
+test_train <- data.frame(Teste=as.numeric(teste_proc$Risk),
+                         LASSO=as.numeric(pred_lasso$.pred_class),
+                         RF=as.numeric(pred_rf$.pred_class),
+                         KNN=as.numeric(pred_knn$.pred_class))
+
+modelos <- colnames(test_train[,2:length(test_train)])
+```
+## ROC
+```{r,echo=TRUE,cache=TRUE,warning=TRUE,include=TRUE,message=FALSE}
+rocs <- roc(Teste ~ ., data = test_train)
+ggplotly(ggroc(rocs))
+```
+
+## EQM
+```{r,echo=TRUE,cache=TRUE,warning=TRUE,include=TRUE,message=FALSE}
+EQMF <- function(x,y) mean((x-y)^2)
+i <- seq(2,ncol(test_train))
+EQM <-sapply(i,function(x) EQMF(test_train[,x],
+                                               test_train$Teste))
+
+fig <- plot_ly(x=~reorder(modelos,EQM),y=EQM,type="bar",name="EQM")
+fig <- fig %>% layout(title = "EQM x Modelo",xaxis = list(title="Modelo"),
+                      yaxis = list(title="EQM"))
+fig
+```
+
+
+
+
+
+
+
